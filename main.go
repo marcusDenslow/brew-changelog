@@ -27,6 +27,13 @@ import (
 // Version is set by ldflags at build time; default for local builds.
 var Version = "dev"
 
+// noMap, when true, bypasses the embedded sources.json lookup and forces
+// the legacy regex URL discovery path. Default behavior (noMap=false) is
+// to consult the db first and fall back to regex only on miss. Bound by
+// the --no-map flag below; kept package-level so processPkg can read it
+// without changing its signature.
+var noMap bool
+
 // Catppuccin Mocha — match the render package's palette.
 var (
 	cpPeach = lipgloss.Color("#fab387") // brew accent
@@ -68,6 +75,9 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
+	rootCmd.Flags().BoolVar(&noMap, "no-map", false,
+		"skip embedded sources.json lookup; force legacy regex URL discovery (debug / benchmark)")
+
 	themeFunc := fang.WithColorSchemeFunc(func(ld lipgloss.LightDarkFunc) fang.ColorScheme {
 		def := fang.DefaultColorScheme(ld)
 		def.Title = cpPeach
@@ -139,7 +149,7 @@ func processPkg(name string) {
 
 	render.Header(name, installed, latest)
 
-	owner, repo, ok := source.GitHubFrom(info)
+	owner, repo, ok := source.Resolve(name, info, !noMap)
 	if !ok {
 		render.NonGitHub(info.Homepage)
 		return
