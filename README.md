@@ -1,3 +1,8 @@
+# DISCLAIMER
+This project is 100% written by AI and contains issues. Open an issue if you find one.
+
+This was only made because i got mad at having to manually check remotes for change logs
+when working on my actual app (terminalShop)
 # brew-changelog
 
 Show GitHub release notes for the version range between your installed and the
