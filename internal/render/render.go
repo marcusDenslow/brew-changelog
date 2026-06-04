@@ -397,6 +397,26 @@ func bucketCap(cat classify.Category) int {
 // that should survive rendering.
 var paragraphSplitRE = regexp.MustCompile(`\n\s*\n`)
 
+// inlinePRRefRE matches an inline PR reference (#NNNN with at least 2 digits)
+// only when it is at the start of the body or follows a non-word char. The
+// non-word-prefix guard rejects compound IDs like "usage#649" where the
+// reference belongs to a different repo and the hyperlink would point at the
+// wrong owner/repo.
+var inlinePRRefRE = regexp.MustCompile(`(?:^|[^\w])#\d{2,}`)
+
+// inlineCodeRE matches a single-backtick code span. Classify intentionally
+// leaves backticks in body text so we can box them visually here.
+var inlineCodeRE = regexp.MustCompile("`([^`]+)`")
+
+// inlineCodeStyle renders code spans as a barely-there highlight. The bg
+// (#272839) sits halfway between cpBase (#1e1e2e) and cpSurface0 (#313244)
+// — close enough to the box base that the chip reads as a soft tint, not a
+// callout. No padding to avoid the trailing-bg leak lipgloss propagates
+// when the outer box fills width after a chip.
+var inlineCodeStyle = lipgloss.NewStyle().
+	Background(lipgloss.Color("#272839")).
+	Foreground(lipgloss.Color(cpText))
+
 func wrapMultiParagraph(text, indent string, width int) string {
 	parts := paragraphSplitRE.Split(text, -1)
 	var out []string
@@ -467,12 +487,12 @@ func bucketString(bucket classify.Bucket, boxInner int, owner, repo string) stri
 		Foreground(lipgloss.Color(cpCrust)).
 		Bold(true).
 		Padding(0, 1).
-		Render(fmt.Sprintf("%s %s", bucket.Category.Icon(), bucket.Category.Label()))
+		Render(bucket.Category.Label())
 	count := dimStyle.Render(fmt.Sprintf(" %d", len(bucket.Bullets)))
 
 	scopeStyle := lipgloss.NewStyle().Foreground(c).Italic(true)
 	prStyle := lipgloss.NewStyle().Foreground(colorDim).Underline(true)
-	authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(cpLavender))
+	authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(cpLavender)).Underline(true)
 	connectorStyle := dimStyle
 	bulletMark := dimStyle.Render("-")
 
@@ -505,11 +525,41 @@ func bucketString(bucket classify.Bucket, boxInner int, owner, repo string) stri
 		// Render each piece as its own self-contained styled token so word-wrap
 		// never slices through an ANSI/OSC escape.
 		text := b.Text
+
+		// Inline code spans (`git::`, `task_config.includes`, etc.) become
+		// boxed chips. Run BEFORE the PR pass so a `#NNNN` written inside
+		// backticks (rare but possible) isn't double-styled.
+		text = inlineCodeRE.ReplaceAllStringFunc(text, func(match string) string {
+			return inlineCodeStyle.Render(match[1 : len(match)-1])
+		})
+
+		// Inline PR refs (e.g. "regression in #9147 combined ...") also get
+		// the underlined-dim style + OSC 8 hyperlink. The `[^\w]` lookbehind
+		// proxy excludes compound IDs like `usage#649` whose owner/repo
+		// differs from the current package — we'd otherwise build a wrong URL.
+		if owner != "" && repo != "" {
+			text = inlinePRRefRE.ReplaceAllStringFunc(text, func(match string) string {
+				hashIdx := strings.IndexByte(match, '#')
+				prefix := match[:hashIdx]
+				prRef := match[hashIdx:]
+				url := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prRef[1:])
+				return prefix + hyperlink(url, prStyle.Render(prRef))
+			})
+		}
+
 		var creditPieces []string
 		if b.Author != "" {
+			styledAuthor := authorStyle.Render(b.Author)
+			// Strip leading @ and trailing [bot] for the URL. Display text
+			// keeps the original form ("@jdx", "@dependabot[bot]"); the link
+			// resolves to the GitHub profile URL.
+			name := strings.TrimSuffix(strings.TrimPrefix(b.Author, "@"), "[bot]")
+			if name != "" {
+				styledAuthor = hyperlink("https://github.com/"+name, styledAuthor)
+			}
 			creditPieces = append(creditPieces,
 				connectorStyle.Render("by"),
-				authorStyle.Render(b.Author),
+				styledAuthor,
 			)
 		}
 		if len(b.PRs) > 0 {

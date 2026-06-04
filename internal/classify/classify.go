@@ -392,28 +392,58 @@ func compress(text string) Bullet {
 			b.PRs = append(b.PRs, ref)
 		}
 	}
-	for _, m := range prRE.FindAllStringSubmatch(text, -1) {
-		addPR(m[1])
-	}
-	// PRs cited as full URLs (the GitHub auto-generated format) also count.
-	for _, m := range prURLRE.FindAllStringSubmatch(text, -1) {
-		addPR(m[1])
-	}
 
-	// Capture the first credited author so renderers can show "by @user in #NNNN".
-	if m := authorCapRE.FindStringSubmatch(text); m != nil {
-		b.Author = m[1]
-	}
-
+	// Resolve [text](url) → text first. The credit tails we care about often
+	// embed the PR ref as a markdown link ("by @user in [#10191](url)" or
+	// "([#10191](url) by @user)"); after resolution they become bare so the
+	// extractors below can read them in one shot.
 	text = mdLinkRE.ReplaceAllString(text, "$1")
+
+	// Extract author + PRs from credit tails ONLY. Two recognised shapes:
+	//
+	//   1. linear:        "...body by @user in #NNNN" / ".. in https://.../pull/NNNN"
+	//      Matched by byAuthorRE (mise CHANGELOG.md, lazygit, fzf, etc.)
+	//
+	//   2. parenthesized: "...body (#NNNN by @user)." or "... ([#NNNN](url) by @user)."
+	//      Matched by prTailRE (GitHub Releases auto-generated format)
+	//
+	// Inline #NNNN refs that are NOT in a credit tail (e.g. "Previously a
+	// regression in #9147 combined with ...") must stay in body text —
+	// extracting them here would both bloat the credit tail AND leave a hole
+	// in the body when the strip pass runs.
+	if tail := byAuthorRE.FindString(text); tail != "" {
+		for _, m := range prRE.FindAllStringSubmatch(tail, -1) {
+			addPR(m[1])
+		}
+		for _, m := range prURLRE.FindAllStringSubmatch(tail, -1) {
+			addPR(m[1])
+		}
+		if am := authorCapRE.FindStringSubmatch(tail); am != nil {
+			b.Author = am[1]
+		}
+	}
+	if tail := prTailRE.FindString(text); tail != "" {
+		for _, m := range prRE.FindAllStringSubmatch(tail, -1) {
+			addPR(m[1])
+		}
+		if b.Author == "" {
+			if am := authorCapRE.FindStringSubmatch(tail); am != nil {
+				b.Author = am[1]
+			}
+		}
+	}
+
 	text = prTailRE.ReplaceAllString(text, "")
 	// byAuthorRE must run BEFORE urlRE so the "in https://...pull/NNNN" tail
 	// is removed in one piece — otherwise urlRE peels off the URL and leaves
 	// a dangling " in " for trim to choke on.
 	text = byAuthorRE.ReplaceAllString(text, "")
 	text = urlRE.ReplaceAllString(text, "")
-	text = prRE.ReplaceAllString(text, "")
-	text = codeSpanRE.ReplaceAllString(text, "$1")
+	// NB: don't strip #NNNN from body. Inline PR refs are part of the
+	// author's narrative and should render as plain text where they appear.
+	// NB: don't strip `code spans` from body either. The renderer wraps each
+	// one in a Background/Foreground inline-box style; stripping here would
+	// lose them.
 	text = strings.ReplaceAll(text, "**", "")
 	text = strings.ReplaceAll(text, "__", "")
 
