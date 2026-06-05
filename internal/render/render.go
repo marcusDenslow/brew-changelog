@@ -195,10 +195,21 @@ func FlatRelease(r release.Release, owner, repo string) {
 
 	arrowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(cpPeach)).Bold(true)
 
+	// Wrap the tag badge in an OSC 8 hyperlink to the GitHub release page.
+	// No style change — the cursor-hover cue on modern terminals (ghostty,
+	// iterm2, wezterm, kitty) signals interactivity; bold tag look is kept.
+	tag := tagStyle.Render(r.TagName)
+	if owner != "" && repo != "" && r.TagName != "" {
+		tag = hyperlink(
+			fmt.Sprintf("https://github.com/%s/%s/releases/tag/%s", owner, repo, r.TagName),
+			tag,
+		)
+	}
+
 	var content strings.Builder
 	content.WriteString(fmt.Sprintf("%s %s  %s",
 		arrowStyle.Render("▸"),
-		tagStyle.Render(r.TagName),
+		tag,
 		dateStyle.Render(date),
 	))
 	if name != "" {
@@ -404,6 +415,13 @@ var paragraphSplitRE = regexp.MustCompile(`\n\s*\n`)
 // wrong owner/repo.
 var inlinePRRefRE = regexp.MustCompile(`(?:^|[^\w])#\d{2,}`)
 
+// inlineSHARefRE matches a 40-char lowercase-hex commit SHA at a word
+// boundary. Renderer shortens to the first 7 chars (GitHub default) and
+// wraps in an OSC 8 hyperlink to the commit page. Pattern is strict to
+// avoid catching long hex IDs from other contexts (e.g. API keys, hashes
+// inside URLs).
+var inlineSHARefRE = regexp.MustCompile(`\b[0-9a-f]{40}\b`)
+
 // inlineCodeRE matches a single-backtick code span. Classify intentionally
 // leaves backticks in body text so we can box them visually here.
 var inlineCodeRE = regexp.MustCompile("`([^`]+)`")
@@ -544,6 +562,15 @@ func bucketString(bucket classify.Bucket, boxInner int, owner, repo string) stri
 				prRef := match[hashIdx:]
 				url := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prRef[1:])
 				return prefix + hyperlink(url, prStyle.Render(prRef))
+			})
+		}
+
+		// Commit SHAs: shorten to 7 chars + OSC 8 hyperlink to the commit
+		// page. Matches existing PR-ref styling for visual consistency.
+		if owner != "" && repo != "" {
+			text = inlineSHARefRE.ReplaceAllStringFunc(text, func(sha string) string {
+				url := fmt.Sprintf("https://github.com/%s/%s/commit/%s", owner, repo, sha)
+				return hyperlink(url, prStyle.Render(sha[:7]))
 			})
 		}
 
