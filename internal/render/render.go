@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"charm.land/glamour/v2"
@@ -15,6 +16,7 @@ import (
 	"github.com/marcusDenslow/brew-changelog/internal/changelog"
 	"github.com/marcusDenslow/brew-changelog/internal/classify"
 	"github.com/marcusDenslow/brew-changelog/internal/release"
+	"github.com/marcusDenslow/brew-changelog/internal/termimg"
 )
 
 // Catppuccin Mocha palette — the canonical dark variant most people mean
@@ -54,7 +56,8 @@ var (
 			Bold(true)
 
 	versionStyle = lipgloss.NewStyle().
-			Foreground(colorVersion)
+			Foreground(colorVersion).
+			Underline(true)
 
 	dividerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(cpSurface2))
@@ -113,10 +116,12 @@ func Header(pkg, installed, latest string) {
 		pkgNameStyle.Render(pkg),
 		versionStyle.Render(fmt.Sprintf("%s → %s", installed, latest)),
 	)
+	content = brightenPlain(content)
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(cpSurface2)).
+		Foreground(lipgloss.Color("#ffffff")).
 		Padding(0, 1).
 		Width(innerWidth).
 		Render(content)
@@ -172,6 +177,257 @@ var categoryColor = map[classify.Category]string{
 	classify.CategoryOther:         cpSubtext0,
 }
 
+// imageRef is an image discovered in a release body.
+type imageRef struct {
+	URL  string
+	Alt  string
+	Lead bool // sits in the first section → drawn at the top of the box body
+	Rows int  // measured kitty render height in terminal rows (0 until measured)
+	Draw bool // true once measured and drawable inline; false => link fallback
+}
+
+var (
+	// htmlImgRE matches a GitHub-flavored <img ... src="URL" ...> tag (the form
+	// the GitHub UI emits when you paste a screenshot). Captures the src URL.
+	htmlImgRE = regexp.MustCompile(`(?is)<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["'][^>]*>`)
+	// htmlAltRE pulls the alt="" attribute out of a matched <img> tag.
+	htmlAltRE = regexp.MustCompile(`(?is)\balt\s*=\s*["']([^"']*)["']`)
+	// mdImgRE matches a markdown image: ![alt](url "title"). Captures alt + url.
+	mdImgRE = regexp.MustCompile(`!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?[^)]*\)`)
+	// htmlWrapRE strips <picture>/<source> wrapper tags left behind once their
+	// inner <img> is extracted, so they don't print as raw HTML.
+	htmlWrapRE = regexp.MustCompile(`(?is)</?(?:picture|source)\b[^>]*>`)
+)
+
+// extractImages removes image markup (HTML <img>, markdown ![]()) from body and
+// returns the cleaned text plus the images found. Only http(s) URLs are kept;
+// data: URIs and relative paths are dropped (we can't fetch them). Each image is
+// flagged Hero when it appears before the first ## section — a top-of-body
+// screenshot — so the caller can place it under the release header instead of at
+// the bottom. Stripping up front also keeps the classifier, lead extractor, and
+// glamour fallback from ever printing raw <img> tags.
+func extractImages(body string) (string, []imageRef) {
+	leadEnd := leadSectionEnd(body)
+	lead := func(start int) bool { return start < leadEnd }
+
+	var refs []imageRef
+	for _, m := range htmlImgRE.FindAllStringSubmatchIndex(body, -1) {
+		url := body[m[2]:m[3]]
+		if !isHTTP(url) {
+			continue
+		}
+		alt := ""
+		if a := htmlAltRE.FindStringSubmatch(body[m[0]:m[1]]); a != nil {
+			alt = a[1]
+		}
+		refs = append(refs, imageRef{URL: url, Alt: alt, Lead: lead(m[0])})
+	}
+	for _, m := range mdImgRE.FindAllStringSubmatchIndex(body, -1) {
+		url := body[m[4]:m[5]]
+		if !isHTTP(url) {
+			continue
+		}
+		refs = append(refs, imageRef{URL: url, Alt: body[m[2]:m[3]], Lead: lead(m[0])})
+	}
+
+	body = htmlImgRE.ReplaceAllString(body, "")
+	body = mdImgRE.ReplaceAllString(body, "")
+	body = htmlWrapRE.ReplaceAllString(body, "")
+	return body, refs
+}
+
+// leadSectionEnd returns the byte offset where the body's first section ends —
+// the start of the second ## / ### header — or len(body) if there's only one
+// section (or none). Images before this offset belong to the lead section, which
+// the renderer surfaces at the top of the box, so they're drawn there; images
+// after it are placed lower (before the change buckets).
+func leadSectionEnd(body string) int {
+	end := len(body)
+	for _, mk := range []string{"\n## ", "\n### "} {
+		if i := strings.Index(body, mk); i >= 0 && i < end {
+			end = i
+		}
+	}
+	return end
+}
+
+func isHTTP(url string) bool {
+	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
+}
+
+// measureImages decides, per image, whether it can be drawn inline (kitty-capable
+// terminal, fetch+decode succeeds) and at what pixel-accurate row height. Images
+// that can't be drawn keep Draw=false and fall back to a hyperlink.
+func measureImages(images []imageRef) {
+	if !termimg.Capable() {
+		return
+	}
+	inner := boxInnerWidth()
+	for i := range images {
+		if rows, err := termimg.Measure(images[i].URL, inner); err == nil {
+			images[i].Rows = rows
+			images[i].Draw = true
+		}
+	}
+}
+
+// imgSentinelPrefix marks a content line as a placeholder for the Nth drawable
+// image. FlatRelease inserts these at the image's mapped position while building
+// the content string; finishBox turns them back into inline image draws. The
+// NUL bytes guarantee the marker never collides with real release text.
+const imgSentinelPrefix = "\x00brewimg\x00"
+
+func sentinelLine(i int) string { return imgSentinelPrefix + strconv.Itoa(i) }
+
+func parseSentinel(line string) (int, bool) {
+	if !strings.HasPrefix(line, imgSentinelPrefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(line[len(imgSentinelPrefix):])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// writeSentinels appends one image-placeholder line per index to b. Each is put
+// on its own line so it becomes a standalone content line.
+func writeSentinels(b *strings.Builder, idxs []int) {
+	for _, i := range idxs {
+		b.WriteByte('\n')
+		b.WriteString(sentinelLine(i))
+	}
+}
+
+// finishBox renders a release box. When there are drawable images, the content
+// (which carries image-placeholder sentinels) is split into text/image segments
+// and drawn with a hand-built box so images sit inline at their real positions.
+// Otherwise it falls back to the lipgloss box. Non-drawable images degrade to
+// links printed below the box.
+func finishBox(content string, drawables, links []imageRef) {
+	if len(drawables) == 0 {
+		printPlainBox(content)
+		renderLinks(links)
+		return
+	}
+	printSegmentedBox(splitSegments(content, drawables))
+	renderLinks(links)
+}
+
+// printPlainBox is the image-free path: a lipgloss rounded box with a leading
+// blank line for inter-release spacing.
+func printPlainBox(content string) {
+	fmt.Println()
+	for _, line := range buildBoxLines(strings.Split(content, "\n")) {
+		fmt.Println("  " + line)
+	}
+}
+
+// boxSegment is one piece of boxed content: either text rows or a single inline
+// image (exactly one of the two is set).
+type boxSegment struct {
+	lines []string
+	image *imageRef
+}
+
+// splitSegments turns a content string (with image-placeholder sentinels) into
+// ordered text/image segments.
+func splitSegments(content string, drawables []imageRef) []boxSegment {
+	var segs []boxSegment
+	var cur []string
+	flush := func() {
+		if len(cur) > 0 {
+			segs = append(segs, boxSegment{lines: cur})
+			cur = nil
+		}
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if i, ok := parseSentinel(line); ok && i >= 0 && i < len(drawables) {
+			flush()
+			segs = append(segs, boxSegment{image: &drawables[i]})
+			continue
+		}
+		cur = append(cur, line)
+	}
+	flush()
+	return segs
+}
+
+// boxBorderStyle matches the lipgloss box border so the hand-built and lipgloss
+// boxes look identical.
+var boxBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(cpSurface1))
+
+// printSegmentedBox draws a rounded box by hand (so we control every row),
+// rendering text rows normally and image segments as inline kitty graphics.
+// Because everything is printed strictly top-to-bottom — the image is drawn at
+// the cursor with C=1, then the cursor is jumped past its cell region to close
+// the right border — there are no cursor moves into already-printed (and possibly
+// scrolled) rows, so it stays correct as the terminal scrolls.
+func printSegmentedBox(segments []boxSegment) {
+	inner := boxInnerWidth()
+	bar := boxBorderStyle.Render("│")
+
+	fmt.Println()
+	fmt.Println("  " + boxBorderStyle.Render("╭"+strings.Repeat("─", inner+2)+"╮"))
+	for _, seg := range segments {
+		if seg.image != nil {
+			printImageRows(*seg.image, inner, bar)
+			continue
+		}
+		for _, line := range seg.lines {
+			line = brightenPlain(line)
+			pad := inner - lipgloss.Width(line)
+			if pad < 0 {
+				pad = 0
+			}
+			fmt.Println("  " + bar + " " + line + strings.Repeat(" ", pad) + " " + bar)
+		}
+	}
+	fmt.Println("  " + boxBorderStyle.Render("╰"+strings.Repeat("─", inner+2)+"╯"))
+}
+
+// printImageRows draws one image inside the hand-built box: a leading blank row
+// for separation, then im.Rows rows where the image occupies the inner cells. On
+// row 0 the image is drawn (kitty C=1 leaves the cursor put) and the cursor is
+// advanced past the inner region to close the border; the remaining rows just
+// draw the borders, leaving the image's cells untouched (so nothing occludes it).
+func printImageRows(im imageRef, inner int, bar string) {
+	blank := "  " + bar + " " + strings.Repeat(" ", inner) + " " + bar
+	fmt.Println(blank)
+
+	fmt.Print("  " + bar + " ")
+	if err := termimg.Draw(os.Stdout, im.URL, inner); err != nil {
+		// Draw failed mid-row: finish the row as blank; the link fallback below
+		// the box still carries the reference.
+		fmt.Printf("\x1b[%dC ", inner)
+		fmt.Println(bar)
+		return
+	}
+	fmt.Printf("\x1b[%dC ", inner) // jump past the image cells to the right pad
+	fmt.Println(bar)
+	for range im.Rows - 1 {
+		fmt.Print("  " + bar + " ")
+		fmt.Printf("\x1b[%dC ", inner)
+		fmt.Println(bar)
+	}
+}
+
+// renderLinks prints dim OSC 8 hyperlinks for images that can't be drawn inline
+// (non-kitty terminal, tmux, or a fetch/decode failure) so the reference is never
+// silently dropped.
+func renderLinks(imgs []imageRef) {
+	for _, im := range imgs {
+		fmt.Println("  " + dimStyle.Render(hyperlink(im.URL, "🖼 "+imageLabel(im.Alt)+" ↗")))
+	}
+}
+
+func imageLabel(alt string) string {
+	if alt != "" {
+		return alt
+	}
+	return "image"
+}
+
 // FlatRelease prints one release inside a rounded box, dynamically sized to
 // the terminal width. Falls back to plain extracted text (from a CHANGES file)
 // or glamour-rendered raw markdown when no buckets are detected.
@@ -217,6 +473,32 @@ func FlatRelease(r release.Release, owner, repo string) {
 	}
 
 	body := strings.TrimSpace(r.Body)
+	// Pull images out before any text processing so raw <img> tags never leak into
+	// the box. measureImages flags which can be drawn inline (kitty) vs. linked.
+	body, images := extractImages(body)
+	measureImages(images)
+
+	// Partition: drawable images become inline sentinels placed by region — lead
+	// images at the top of the body, the rest just before the change buckets — so
+	// they sit where they appeared in the source. Non-drawable images fall back to
+	// links printed below the box.
+	var drawables, links []imageRef
+	var leadIdx, bodyIdx []int
+	for _, im := range images {
+		if !im.Draw {
+			links = append(links, im)
+			continue
+		}
+		i := len(drawables)
+		drawables = append(drawables, im)
+		if im.Lead {
+			leadIdx = append(leadIdx, i)
+		} else {
+			bodyIdx = append(bodyIdx, i)
+		}
+	}
+	writeSentinels(&content, leadIdx) // directly under the header line
+
 	result := classify.Classify(body)
 	source := ""
 
@@ -233,7 +515,8 @@ func FlatRelease(r release.Release, owner, repo string) {
 					content.WriteString(dimStyle.Render("(from " + cl.Path + ")"))
 					content.WriteString("\n")
 					content.WriteString(section)
-					printInBox(content.String())
+					writeSentinels(&content, bodyIdx)
+					finishBox(content.String(), drawables, links)
 					return
 				}
 			}
@@ -252,7 +535,8 @@ func FlatRelease(r release.Release, owner, repo string) {
 			content.WriteString("\n")
 			content.WriteString(rendered)
 		}
-		printInBox(content.String())
+		writeSentinels(&content, bodyIdx)
+		finishBox(content.String(), drawables, links)
 		return
 	}
 
@@ -268,6 +552,8 @@ func FlatRelease(r release.Release, owner, repo string) {
 		content.WriteString(wrapMultiParagraph(lead, "", innerWidth))
 	}
 
+	writeSentinels(&content, bodyIdx) // between the lead prose and the buckets
+
 	for _, bucket := range result.Buckets {
 		content.WriteString("\n\n")
 		content.WriteString(bucketString(bucket, innerWidth, owner, repo))
@@ -278,7 +564,7 @@ func FlatRelease(r release.Release, owner, repo string) {
 		content.WriteString(dimStyle.Render("(notes fetched from " + source + ")"))
 	}
 
-	printInBox(content.String())
+	finishBox(content.String(), drawables, links)
 }
 
 var (
@@ -362,8 +648,11 @@ func boxInnerWidth() int {
 // our continuation indents on already-wrapped lines. Instead, bullets are
 // pre-wrapped in bucketString to fit boxInnerWidth(), and we pad each content
 // line to that width manually so the box renders at a uniform size.
-func printInBox(content string) {
+// buildBoxLines renders content lines inside a rounded box and returns the box's
+// lines (without the 2-space left margin the caller prepends when printing).
+func buildBoxLines(lines []string) []string {
 	inner := boxInnerWidth()
+	content := brightenPlain(strings.Join(lines, "\n"))
 	var padded []string
 	for _, line := range strings.Split(content, "\n") {
 		w := lipgloss.Width(line)
@@ -375,13 +664,10 @@ func printInBox(content string) {
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(cpSurface1)).
+		Foreground(lipgloss.Color("#ffffff")).
 		Padding(0, 1).
 		Render(strings.Join(padded, "\n"))
-
-	fmt.Println()
-	for _, line := range strings.Split(box, "\n") {
-		fmt.Println("  " + line)
-	}
+	return strings.Split(box, "\n")
 }
 
 // bucketCap returns how many bullets to show before truncating. High-signal
@@ -434,6 +720,23 @@ var inlineCodeRE = regexp.MustCompile("`([^`]+)`")
 var inlineCodeStyle = lipgloss.NewStyle().
 	Background(lipgloss.Color("#272839")).
 	Foreground(lipgloss.Color(cpText))
+
+// Force cpText foreground on body prose so it reads bright regardless of the
+// terminal's default fg. Re-applied after every embedded reset so nested
+// styled tokens (PR refs, code chips) don't drop the color downstream.
+const whiteFg = "\x1b[38;2;255;255;255m"
+
+// Lipgloss emits `\x1b[m` (empty params) for reset; glamour or other writers
+// may emit `\x1b[0m`. Match both so plain text following any styled token
+// (chip, PR ref, SHA, scope, badge, author) gets the box's default foreground
+// re-applied instead of falling back to the terminal's native fg color.
+var resetRE = regexp.MustCompile(`\x1b\[0?m`)
+
+func brightenPlain(s string) string {
+	return resetRE.ReplaceAllStringFunc(s, func(reset string) string {
+		return reset + whiteFg
+	})
+}
 
 func wrapMultiParagraph(text, indent string, width int) string {
 	parts := paragraphSplitRE.Split(text, -1)
@@ -509,7 +812,7 @@ func bucketString(bucket classify.Bucket, boxInner int, owner, repo string) stri
 	count := dimStyle.Render(fmt.Sprintf(" %d", len(bucket.Bullets)))
 
 	scopeStyle := lipgloss.NewStyle().Foreground(c).Italic(true)
-	prStyle := lipgloss.NewStyle().Foreground(colorDim).Underline(true)
+	prStyle := lipgloss.NewStyle().Foreground(colorVersion).Underline(true)
 	authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(cpLavender)).Underline(true)
 	connectorStyle := dimStyle
 	bulletMark := dimStyle.Render("-")

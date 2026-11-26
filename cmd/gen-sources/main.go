@@ -76,7 +76,13 @@ func main() {
 	workers := flag.Int("workers", 4, "concurrent probe workers (auth API is rate-limit constrained)")
 	probeTimeout := flag.Duration("probe-timeout", 10*time.Second, "per-request timeout for probes")
 	limit := flag.Int("limit", 0, "probe at most N github repos (0 = all); useful for smoke tests")
+	casksOnly := flag.Bool("casks", false, "scan casks only; merge results into existing sources.json (keeps formula entries)")
 	flag.Parse()
+
+	if *casksOnly {
+		runCasks(*out, *workers, *probeTimeout, *limit, *noProbe, *reportOnly)
+		return
+	}
 
 	fmt.Fprintln(os.Stderr, "running `brew info --json=v2 --eval-all` (slow, ~30s)…")
 	raw, err := exec.Command("brew", "info", "--json=v2", "--eval-all").Output()
@@ -500,4 +506,112 @@ func pctOf(part, total int) float64 {
 		return 0
 	}
 	return 100.0 * float64(part) / float64(total)
+}
+
+// runCasks walks every cask reachable via `brew info --json=v2 --cask --eval-all`,
+// resolves each to a GitHub repo via homepage/url, probes for an in-tree
+// changelog file, and merges the results into the existing sources.json. The
+// existing formula entries are preserved exactly; only cask names are added
+// or replaced.
+func runCasks(outPath string, workers int, perReqTimeout time.Duration, limit int, noProbe, reportOnly bool) {
+	fmt.Fprintln(os.Stderr, "running `brew info --json=v2 --cask --eval-all` (slow)…")
+	raw, err := exec.Command("brew", "info", "--json=v2", "--cask", "--eval-all").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "brew info --cask: %v\n", err)
+		os.Exit(1)
+	}
+
+	var resp struct {
+		Casks []struct {
+			Token    string `json:"token"`
+			Homepage string `json:"homepage"`
+			URL      string `json:"url"`
+		} `json:"casks"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		fmt.Fprintf(os.Stderr, "parse brew info json: %v\n", err)
+		os.Exit(1)
+	}
+
+	refs := make(map[string]repoRef, len(resp.Casks))
+	for _, c := range resp.Casks {
+		for _, candidate := range []string{c.Homepage, c.URL} {
+			m := githubRE.FindStringSubmatch(candidate)
+			if m == nil {
+				continue
+			}
+			repo := strings.TrimSuffix(m[2], ".git")
+			repo = strings.TrimSuffix(repo, "/")
+			refs[c.Token] = repoRef{name: c.Token, owner: m[1], repo: repo}
+			break
+		}
+	}
+
+	total := len(resp.Casks)
+	resolved := len(refs)
+	fmt.Fprintf(os.Stderr, "\nresolved: %d / %d casks (%.1f%%)\n", resolved, total, pctOf(resolved, total))
+
+	existing, err := loadSources(outPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load existing %s: %v\n", outPath, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "loaded %d existing entries from %s\n", len(existing), outPath)
+
+	fileURLs := map[string]string{}
+	if !noProbe {
+		probeRefs := refs
+		if limit > 0 && limit < len(refs) {
+			probeRefs = pickN(refs, limit)
+			fmt.Fprintf(os.Stderr, "\nlimit=%d → probing only the first %d github casks\n", limit, len(probeRefs))
+		}
+		fileURLs = probeAll(probeRefs, workers, perReqTimeout)
+	}
+
+	caskAdded := 0
+	for name, r := range refs {
+		var s sourcedb.Source
+		if url, ok := fileURLs[name]; ok {
+			s = sourcedb.Source{Kind: "file", URL: url}
+		} else {
+			s = sourcedb.Source{
+				Kind: "releases",
+				URL:  fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", r.owner, r.repo),
+			}
+		}
+		if _, present := existing[name]; !present {
+			caskAdded++
+		}
+		existing[name] = s
+	}
+
+	fmt.Fprintf(os.Stderr, "\nmerge: %d cask entries added (or updated), %d total in map\n", caskAdded, len(existing))
+	printKindStats(existing)
+
+	if reportOnly {
+		return
+	}
+
+	if err := writeSortedJSON(outPath, existing); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", outPath, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "\nwrote %s (%d entries)\n", outPath, len(existing))
+}
+
+// loadSources reads an existing sources.json into a map. Returns an empty map
+// when the file does not exist so a first cask-only run still works.
+func loadSources(path string) (map[string]sourcedb.Source, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]sourcedb.Source{}, nil
+		}
+		return nil, err
+	}
+	var m map[string]sourcedb.Source
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }

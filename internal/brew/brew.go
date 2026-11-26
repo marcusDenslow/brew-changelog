@@ -20,7 +20,9 @@ type FormulaInfo struct {
 	StableURL    string // urls.stable.url
 }
 
-// Outdated returns the names of every outdated formula. Casks are excluded.
+// Outdated returns the names of every outdated formula and cask. Casks with
+// auto-updates are excluded unless --greedy is passed to brew; the default
+// behaviour matches what `brew outdated` shows in the terminal.
 func Outdated() ([]string, error) {
 	out, err := exec.Command("brew", "outdated", "--json=v2").Output()
 	if err != nil {
@@ -30,20 +32,30 @@ func Outdated() ([]string, error) {
 		Formulae []struct {
 			Name string `json:"name"`
 		} `json:"formulae"`
+		Casks []struct {
+			Name string `json:"name"`
+		} `json:"casks"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, fmt.Errorf("parse brew outdated json: %w", err)
 	}
-	names := make([]string, 0, len(resp.Formulae))
+	names := make([]string, 0, len(resp.Formulae)+len(resp.Casks))
 	for _, f := range resp.Formulae {
 		names = append(names, f.Name)
+	}
+	for _, c := range resp.Casks {
+		names = append(names, c.Name)
 	}
 	return names, nil
 }
 
-// Info runs `brew info --json=v2 --formula <name>` and extracts version + URL fields.
+// Info runs `brew info --json=v2 <name>` (no --formula / --cask flag so brew
+// will match either kind) and extracts version + URL fields. Cask JSON shape
+// differs from formula — `version` is a flat string, `url` is the artifact
+// URL, `installed` is a string or null — and is mapped onto the same
+// FormulaInfo struct so downstream code stays agnostic to kind.
 func Info(name string) (*FormulaInfo, error) {
-	out, err := exec.Command("brew", "info", "--json=v2", "--formula", name).Output()
+	out, err := exec.Command("brew", "info", "--json=v2", name).Output()
 	if err != nil {
 		return nil, fmt.Errorf("brew info %s: %w", name, err)
 	}
@@ -66,25 +78,45 @@ func Info(name string) (*FormulaInfo, error) {
 				} `json:"head"`
 			} `json:"urls"`
 		} `json:"formulae"`
+		Casks []struct {
+			Token     string  `json:"token"`
+			Homepage  string  `json:"homepage"`
+			URL       string  `json:"url"`
+			Version   string  `json:"version"`
+			Installed *string `json:"installed"`
+		} `json:"casks"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, fmt.Errorf("parse brew info json: %w", err)
 	}
-	if len(resp.Formulae) == 0 {
-		return nil, fmt.Errorf("no formula in brew info response for %s", name)
+	if len(resp.Formulae) > 0 {
+		f := resp.Formulae[0]
+		info := &FormulaInfo{
+			Name:         f.Name,
+			LatestStable: f.Versions.Stable,
+			Homepage:     f.Homepage,
+			HeadURL:      f.URLs.Head.URL,
+			StableURL:    f.URLs.Stable.URL,
+		}
+		if len(f.Installed) > 0 {
+			info.Installed = f.Installed[0].Version
+		}
+		return info, nil
 	}
-	f := resp.Formulae[0]
-	info := &FormulaInfo{
-		Name:         f.Name,
-		LatestStable: f.Versions.Stable,
-		Homepage:     f.Homepage,
-		HeadURL:      f.URLs.Head.URL,
-		StableURL:    f.URLs.Stable.URL,
+	if len(resp.Casks) > 0 {
+		c := resp.Casks[0]
+		info := &FormulaInfo{
+			Name:         c.Token,
+			LatestStable: c.Version,
+			Homepage:     c.Homepage,
+			StableURL:    c.URL,
+		}
+		if c.Installed != nil {
+			info.Installed = *c.Installed
+		}
+		return info, nil
 	}
-	if len(f.Installed) > 0 {
-		info.Installed = f.Installed[0].Version
-	}
-	return info, nil
+	return nil, fmt.Errorf("no formula or cask in brew info response for %s", name)
 }
 
 // NormalizeVersion strips a leading "v" and brew's "_N" revision suffix.

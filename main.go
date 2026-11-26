@@ -134,7 +134,7 @@ func preflight() error {
 func processPkg(name string) {
 	info, err := brew.Info(name)
 	if err != nil {
-		render.Skip(name, "not a formula")
+		render.Skip(name, "not a formula or cask")
 		return
 	}
 	if info.Installed == "" || info.LatestStable == "" {

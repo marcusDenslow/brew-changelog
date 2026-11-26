@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/fang v1.0.0
 	github.com/hashicorp/go-version v1.9.0
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.43.0
 )
 
@@ -42,6 +43,5 @@ require (
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
 	golang.org/x/net v0.39.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 )
